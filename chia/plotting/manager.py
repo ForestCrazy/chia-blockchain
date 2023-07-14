@@ -113,7 +113,7 @@ class PlotManager:
     def start_refreshing(self, sleep_interval_ms: int = 1000):
         self._refreshing_enabled = True
         if self._refresh_thread is None or not self._refresh_thread.is_alive():
-            self.cache.load()
+            # self.cache.load()
             self._refresh_thread = threading.Thread(target=self._refresh_task, args=(sleep_interval_ms,))
             self._refresh_thread.start()
 
@@ -216,7 +216,8 @@ class PlotManager:
                 self.log.debug(f"_refresh_task: cached entries removed: {len(remove_paths)}")
 
                 if self.cache.changed():
-                    self.cache.save()
+                    # self.cache.save()
+                    pass
 
                 self.last_refresh_time = time.time()
 
@@ -280,7 +281,7 @@ class PlotManager:
                     # TODO: consider checking if the file was just written to (which would mean that the file is still
                     # being copied). A segfault might happen in this edge case.
 
-                    if prover.get_size() >= 30 and stat_info.st_size < 0.98 * expected_size:
+                    if not "--remoteplot--" in str(file_path) and prover.get_size() >= 30 and stat_info.st_size < 0.98 * expected_size:
                         log.warning(
                             f"Not farming plot {file_path}. Size is {stat_info.st_size / (1024 ** 3)} GiB, but expected"
                             f" at least: {expected_size / (1024 ** 3)} GiB. We assume the file is being copied."
