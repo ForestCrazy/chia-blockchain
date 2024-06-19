@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 import traceback
 from math import floor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, List, Optional, Set, Tuple, Union, cast
 
 import aiohttp
-from blspy import AugSchemeMPL, G1Element, G2Element, PrivateKey
+from chia_rs import AugSchemeMPL, G1Element, G2Element, PrivateKey
 
 from chia.consensus.constants import ConsensusConstants
 from chia.daemon.keychain_proxy import KeychainProxy, connect_to_keychain_and_validate, wrap_local_keychain
@@ -38,7 +39,7 @@ from chia.server.ws_connection import WSChiaConnection
 from chia.ssl.create_ssl import get_mozilla_ca_crt
 from chia.types.blockchain_format.proof_of_space import ProofOfSpace
 from chia.types.blockchain_format.sized_bytes import bytes32
-from chia.util.bech32m import decode_puzzle_hash
+from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 from chia.util.byte_types import hexstr_to_bytes
 from chia.util.config import config_path_for_filename, load_config, lock_and_load_config, save_config
 from chia.util.errors import KeychainProxyConnectionFailure
@@ -107,6 +108,11 @@ HARVESTER PROTOCOL (FARMER <-> HARVESTER)
 
 
 class Farmer:
+    if TYPE_CHECKING:
+        from chia.rpc.rpc_server import RpcServiceProtocol
+
+        _protocol_check: ClassVar[RpcServiceProtocol] = cast("Farmer", None)
+
     def __init__(
         self,
         root_path: Path,
@@ -165,6 +171,39 @@ class Farmer:
 
         # Use to find missing signage points. (new_signage_point, time)
         self.prev_signage_point: Optional[Tuple[uint64, farmer_protocol.NewSignagePoint]] = None
+
+    @contextlib.asynccontextmanager
+    async def manage(self) -> AsyncIterator[None]:
+        async def start_task() -> None:
+            # `Farmer.setup_keys` returns `False` if there are no keys setup yet. In this case we just try until it
+            # succeeds or until we need to shut down.
+            while not self._shut_down:
+                if await self.setup_keys():
+                    self.update_pool_state_task = asyncio.create_task(self._periodically_update_pool_state_task())
+                    self.cache_clear_task = asyncio.create_task(self._periodically_clear_cache_and_refresh_task())
+                    await self.og_pooling.start()
+                    log.debug("start_task: initialized")
+                    self.started = True
+                    return
+                await asyncio.sleep(1)
+
+        asyncio.create_task(start_task())
+        try:
+            yield
+        finally:
+            self._shut_down = True
+
+            if self.cache_clear_task is not None:
+                await self.cache_clear_task
+            if self.update_pool_state_task is not None:
+                await self.update_pool_state_task
+            await self.og_pooling.close()
+            if self.keychain_proxy is not None:
+                proxy = self.keychain_proxy
+                self.keychain_proxy = None
+                await proxy.close()
+                await asyncio.sleep(0.5)  # https://docs.aiohttp.org/en/stable/client_advanced.html#graceful-shutdown
+            self.started = False
 
     def get_connections(self, request_node_type: Optional[NodeType]) -> List[Dict[str, Any]]:
         return default_get_connections(server=self.server, request_node_type=request_node_type)
@@ -226,38 +265,6 @@ class Farmer:
 
         return True
 
-    async def _start(self) -> None:
-        async def start_task() -> None:
-            # `Farmer.setup_keys` returns `False` if there are no keys setup yet. In this case we just try until it
-            # succeeds or until we need to shut down.
-            while not self._shut_down:
-                if await self.setup_keys():
-                    self.update_pool_state_task = asyncio.create_task(self._periodically_update_pool_state_task())
-                    self.cache_clear_task = asyncio.create_task(self._periodically_clear_cache_and_refresh_task())
-                    await self.og_pooling.start()
-                    log.debug("start_task: initialized")
-                    self.started = True
-                    return
-                await asyncio.sleep(1)
-
-        asyncio.create_task(start_task())
-
-    def _close(self) -> None:
-        self._shut_down = True
-
-    async def _await_closed(self, shutting_down: bool = True) -> None:
-        if self.cache_clear_task is not None:
-            await self.cache_clear_task
-        if self.update_pool_state_task is not None:
-            await self.update_pool_state_task
-        await self.og_pooling.close()
-        if shutting_down and self.keychain_proxy is not None:
-            proxy = self.keychain_proxy
-            self.keychain_proxy = None
-            await proxy.close()
-            await asyncio.sleep(0.5)  # https://docs.aiohttp.org/en/stable/client_advanced.html#graceful-shutdown
-        self.started = False
-
     def _set_state_changed_callback(self, callback: StateChangedProtocol) -> None:
         self.state_changed_callback = callback
 
@@ -310,7 +317,7 @@ class Farmer:
             value=ErrorResponse(uint16(PoolErrorCode.REQUEST_FAILED.value), error_message).to_json_dict(),
         )
 
-    def on_disconnect(self, connection: WSChiaConnection) -> None:
+    async def on_disconnect(self, connection: WSChiaConnection) -> None:
         self.log.info(f"peer disconnected {connection.get_peer_logging()}")
         self.state_changed("close_connection", {})
         if connection.connection_type is NodeType.HARVESTER:
@@ -528,6 +535,8 @@ class Farmer:
                         "valid_partials_24h": [],
                         "invalid_partials_since_start": 0,
                         "invalid_partials_24h": [],
+                        "insufficient_partials_since_start": 0,
+                        "insufficient_partials_24h": [],
                         "stale_partials_since_start": 0,
                         "stale_partials_24h": [],
                         "missing_partials_since_start": 0,
@@ -832,3 +841,59 @@ class Farmer:
                 log.error(f"_periodically_clear_cache_and_refresh_task failed: {traceback.format_exc()}")
 
             await asyncio.sleep(1)
+
+    def notify_farmer_reward_taken_by_harvester_as_fee(
+        self, sp: farmer_protocol.NewSignagePoint, proof_of_space: harvester_protocol.NewProofOfSpace
+    ) -> None:
+        """
+        Apply a fee quality convention (see CHIP-22: https://github.com/Chia-Network/chips/pull/88)
+        given the proof and signage point. This will be tested against the fee threshold reported
+        by the harvester (if any), and logged.
+        """
+        assert proof_of_space.farmer_reward_address_override is not None
+
+        challenge_str = str(sp.challenge_hash)
+
+        ph_prefix = self.config["network_overrides"]["config"][self.config["selected_network"]]["address_prefix"]
+        farmer_reward_puzzle_hash = encode_puzzle_hash(proof_of_space.farmer_reward_address_override, ph_prefix)
+
+        self.log.info(
+            f"Farmer reward for challenge '{challenge_str}' "
+            + f"taken by harvester for reward address '{farmer_reward_puzzle_hash}'"
+        )
+
+        fee_quality = calculate_harvester_fee_quality(proof_of_space.proof.proof, sp.challenge_hash)
+        fee_quality_rate = float(fee_quality) / float(0xFFFFFFFF) * 100.0
+
+        if proof_of_space.fee_info is not None:
+            fee_threshold = proof_of_space.fee_info.applied_fee_threshold
+            fee_threshold_rate = float(fee_threshold) / float(0xFFFFFFFF) * 100.0
+
+            if fee_quality <= fee_threshold:
+                self.log.info(
+                    f"Fee threshold passed for challenge '{challenge_str}': "
+                    + f"{fee_quality_rate:.3f}%/{fee_threshold_rate:.3f}% ({fee_quality}/{fee_threshold})"
+                )
+            else:
+                self.log.warning(
+                    f"Invalid fee threshold for challenge '{challenge_str}': "
+                    + f"{fee_quality_rate:.3f}%/{fee_threshold_rate:.3f}% ({fee_quality}/{fee_threshold})"
+                )
+                self.log.warning(
+                    "Harvester illegitimately took a fee reward that "
+                    + "did not belong to it or it incorrectly applied the fee convention."
+                )
+        else:
+            self.log.warning(
+                "Harvester illegitimately took reward by failing to provide its fee rate "
+                + f"for challenge '{challenge_str}'. "
+                + f"Fee quality was {fee_quality_rate:.3f}% ({fee_quality} or 0x{fee_quality:08x})"
+            )
+
+
+def calculate_harvester_fee_quality(proof: bytes, challenge: bytes32) -> uint32:
+    """
+    This calculates the 'fee quality' given a convention between farmers and third party harvesters.
+    See CHIP-22: https://github.com/Chia-Network/chips/pull/88
+    """
+    return uint32(int.from_bytes(std_hash(proof + challenge)[32 - 4 :], byteorder="big", signed=False))

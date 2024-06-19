@@ -75,7 +75,10 @@ def get_bladebit_src_path(plotters_root_path: Path) -> Path:
 
 
 def get_bladebit_package_path() -> Path:
-    return Path(os.path.dirname(sys.executable)) / "bladebit"
+    p = Path(os.path.dirname(sys.executable)).joinpath("_internal/bladebit")
+    if p.exists():
+        return p
+    return Path(os.path.dirname(sys.executable)).joinpath("bladebit")
 
 
 def get_bladebit_exec_path(with_cuda: bool = False) -> str:
@@ -365,8 +368,10 @@ def plot_bladebit(args, chia_root_path, root_path):
     if "device" in args and str(args.device).isdigit():
         call_args.append("--device")
         call_args.append(str(args.device))
-    if "no_direct_downloads" in args and args.no_direct_downloads is not None:
-        call_args.append("--no-direct-downloads")
+    if "disk_128" in args and args.disk_128:
+        call_args.append("--disk-128")
+    if "disk_16" in args and args.disk_16:
+        call_args.append("--disk-16")
 
     call_args.append(args.finaldir)
 

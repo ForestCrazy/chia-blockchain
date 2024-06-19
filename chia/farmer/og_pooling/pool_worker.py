@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Optional, Dict, Tuple, Any
 
-from blspy import G1Element, G2Element, AugSchemeMPL
+from chia_rs import G1Element, G2Element, AugSchemeMPL
 
 import chia.server.ws_connection as ws
 from chia.consensus.pot_iterations import calculate_sp_interval_iters, calculate_iterations_quality
@@ -224,6 +224,8 @@ class PoolWorker:
             new_proof_of_space.challenge_hash,
             new_proof_of_space.sp_hash,
             [m_to_sign],
+            message_data=None,
+            rc_block_unfinished=None,
         )
         sign_response: Any = await peer.call_api(HarvesterAPI.request_signatures, request)
         if not isinstance(sign_response, harvester_protocol.RespondSignatures):
